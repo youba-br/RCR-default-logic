@@ -5,7 +5,6 @@ Interface graphique : PyQt6 | Langage : Python 3
 CONTENU
 - app.py         : interface graphique PyQt6
 - logic.py       : moteur logique indépendant de l'interface
-- test_logic.py  : tests unitaires du moteur logique
 - requirements.txt : dépendance de l'interface
 
 INSTALLATION
@@ -43,7 +42,7 @@ FONCTIONNALITES
 - Sauvegarder et recharger une théorie au format JSON, avec les extensions déjà calculées.
 - Charger des exemples et lancer le diagnostic des justifications.
 - Avertir immédiatement lors de l’ajout d’un défaut si une justification est
-  individuellement incohérente (ex. : x & ~x), car le défaut ne sera jamais applicable.
+  individuellement incohérente (ex. : x & ~x).
 - Signaler également les justifications individuellement cohérentes mais incompatibles
   entre elles.
 
