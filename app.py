@@ -67,10 +67,12 @@ class App(QMainWindow):
         titles.addWidget(title); titles.addWidget(subtitle)
         header.addLayout(titles); header.addStretch()
 
-        for text, slot in [("Nouveau", self.new_theory), ("Ouvrir", self.open_file),
-                            ("Enregistrer", self.save_file), ("Enregistrer sous", self.save_as),
-                            ("Exemples", self.load_example)]:
-                b = QPushButton(text); b.clicked.connect(slot); header.addWidget(b)
+        for text, slot in [("Nouveau", self.new_theory), ("Ouvrir", self.open_file), ("Importer TXT", self.import_txt_file),
+                   ("Enregistrer", self.save_file), ("Enregistrer sous", self.save_as),
+                   ("Exemples", self.load_example)]:
+            
+            b = QPushButton(text); b.clicked.connect(slot); header.addWidget(b)
+
         root.addLayout(header)
 
 
@@ -280,6 +282,157 @@ class App(QMainWindow):
             self._refresh_lists()
             self._write(f"Théorie chargée : {path}\n{len(self.world)} formule(s), {len(self.defaults)} défaut(s), {len(self.extensions)} extension(s) sauvegardée(s).")
         except Exception as exc: self._error("Chargement impossible", exc)
+
+
+    def import_txt_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Importer une théorie depuis un fichier texte",
+            "",
+            "Fichiers texte (*.txt)"
+        )
+
+        if not path:
+            return
+
+        try:
+            lines = Path(path).read_text(encoding="utf-8-sig").splitlines()
+
+            world = []
+            defaults = []
+
+            section = None
+            found_world = False
+            found_defaults = False
+
+            for line_number, line in enumerate(lines, 1):
+                line = line.strip()
+
+                # Ignore empty lines
+                if not line:
+                    continue
+
+                # Detect section headers and comments
+                if line.startswith("#"):
+                    header = line[1:].strip().lower()
+
+                    if "monde" in header:
+                        section = "world"
+                        found_world = True
+
+                    elif "defaut" in header:
+                        section = "defaults"
+                        found_defaults = True
+
+                    continue
+
+                if section is None:
+                    raise ValueError(
+                        f"Ligne {line_number}: "
+                        "La formule doit être placée dans une section."
+                    )
+
+                try:
+                    if section == "world":
+                        parse_formula(line)
+                        world.append(line)
+
+                    elif section == "defaults":
+                        parts = line.split("/")
+
+                        if len(parts) != 2:
+                            raise ValueError(
+                                "Format incorrect. Utilisez : "
+                                "prérequis : justifications / conséquent"
+                            )
+
+                        left_part = parts[0].split(":")
+
+                        if len(left_part) != 2:
+                            raise ValueError(
+                                "Il manque le symbole ':' dans le défaut."
+                            )
+
+                        prerequisite = left_part[0].strip()
+
+                        justifications = [
+                            x.strip()
+                            for x in left_part[1].split(",")
+                            if x.strip()
+                        ]
+
+                        consequent = parts[1].strip()
+
+                        default = Default(
+                            prerequisite,
+                            justifications,
+                            consequent
+                        )
+
+                        default.validate()
+                        defaults.append(default)
+
+                except Exception as exc:
+                    raise ValueError(
+                        f"Erreur à la ligne {line_number}: {exc}"
+                    ) from exc
+
+            if not found_world or not found_defaults:
+                raise ValueError(
+                    "Le fichier doit contenir les deux sections : "
+                    "# Monde W et # Defauts D."
+                )
+
+            # Validate the complete theory before modifying the GUI
+            theory = Theory(world, defaults)
+            theory.validate()
+
+            # Check individually inconsistent justifications
+            warnings = []
+
+            for i, default in enumerate(defaults, 1):
+                for justification in default.justifications:
+                    if not consistent([justification]):
+                        warnings.append(
+                            f"d{i}: justification incohérente : "
+                            f"{justification}"
+                        )
+
+            # Update the application
+            self.world = theory.world
+            self.defaults = theory.defaults
+            self.extensions = []
+            self.path = None
+
+            self._refresh_lists()
+
+            message = (
+                f"Théorie importée avec succès !\n\n"
+                f"Formules dans W : {len(world)}\n"
+                f"Défauts dans D : {len(defaults)}"
+            )
+
+            if warnings:
+                message += "\n\nAvertissements :\n"
+                message += "\n".join(warnings)
+
+            self._write(message)
+
+            self.status_bar.showMessage(
+                "Théorie importée depuis un fichier TXT.",
+                5000
+            )
+
+            if warnings:
+                QMessageBox.warning(
+                    self,
+                    "Importation avec avertissements",
+                    message
+                )
+
+        except Exception as exc:
+            self._error("Erreur d'importation", exc)
+
 
     def load_example(self):
         examples = {
