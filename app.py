@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QTextEdit, QMessageBox, QFileDialog, QSplitter, QInputDialog, QStatusBar,
 )
 
-from logic import Theory, Default, DefaultLogic, FormulaError, parse_formula, consistent
+from logic import Theory, Default, DefaultLogic, FormulaError, parse_formula, consistent, entails
 
 APP_STYLE = """
 QMainWindow, QWidget { background: #f4f6fa; color: #202938; font-family: 'Segoe UI', Arial; font-size: 10pt; }
@@ -68,7 +68,7 @@ class App(QMainWindow):
         header.addLayout(titles); header.addStretch()
 
         for text, slot in [("Nouveau", self.new_theory), ("Ouvrir", self.open_file), ("Importer TXT", self.import_txt_file),
-                   ("Enregistrer", self.save_file), ("Enregistrer sous", self.save_as),
+                   ("Enregistrer", self.save_file),
                    ("Exemples", self.load_example)]:
             
             b = QPushButton(text); b.clicked.connect(slot); header.addWidget(b)
@@ -212,18 +212,45 @@ class App(QMainWindow):
         try: warnings = DefaultLogic(self._theory()).diagnostics()
         except Exception as exc: self._error("Diagnostic impossible", exc); return
         self._write("DIAGNOSTIC\n\n" + ("\n".join("• " + w for w in warnings) if warnings else "Aucun avertissement détecté. W et les justifications de chaque défaut sont cohérents."))
-
     def generate_extensions(self):
-        try: self.extensions = DefaultLogic(self._theory()).generate_extensions()
-        except Exception as exc: self._error("Calcul impossible", exc); return
-        if not self.extensions:
-            self._write("Aucune extension trouvée. Vérifiez la cohérence de W et les défauts.")
+        try:
+            self.extensions = DefaultLogic(self._theory()).generate_extensions()
+        except Exception as exc:
+            self._error("Calcul impossible", exc)
             return
+
+        if not self.extensions:
+            self._write("Aucune extension trouvée.")
+            return
+
         lines = [f"{len(self.extensions)} extension(s) trouvée(s)."]
+
         for i, extension in enumerate(self.extensions, 1):
-            lines += ["", f"E{i} = Th({{{'; '.join(extension['basis'])}}})",
-                      "Défauts appliqués : " + (" ; ".join(extension['defaults']) if extension['defaults'] else "aucun")]
-        self._write("\n".join(lines)); self.status_bar.showMessage(f"{len(self.extensions)} extension(s) générée(s).", 4000)
+            basis = extension["basis"]
+            display_basis = list(basis)
+
+            atoms = sorted(set().union(
+                *(parse_formula(f).atoms() for f in basis)
+            )) if basis else []
+
+            for atom in atoms:
+                if entails(basis, f"~{atom}"):
+                    if f"~{atom}" not in display_basis:
+                        display_basis.append(f"~{atom}")
+                elif entails(basis, atom):
+                    if atom not in display_basis:
+                        display_basis.append(atom)
+
+            lines += [
+                "",
+                f"E{i} = Th({{{'; '.join(display_basis)}}})",
+                "Défauts appliqués : " +
+                (" ; ".join(extension["defaults"])
+                 if extension["defaults"] else "aucun")
+            ]
+
+        self._write("\n".join(lines))
+
 
     def test_consequence(self):
         formula = self.query_entry.text().strip()
