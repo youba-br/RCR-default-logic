@@ -1,323 +1,499 @@
-"""Core propositional default logic engine (independent from the GUI).
+"""Core propositional default-logic engine (independent from the GUI).
 
 Moteur de la logique des défauts de Reiter (logique propositionnelle).
-Ce module ne dépend d'aucune bibliothèque graphique : toute la logique est ici,
-l'interface (app.py) se contente de l'appeler.
 
-Formula syntax: atoms (p, P, P(x)), negation ~, conjunction &, disjunction |,
-implication ->, equivalence <->, and parentheses. Predicates are treated as
-atomic propositions; quantifiers and first-order unification are not implemented.
+Formula syntax
+--------------
+Atoms: p, P, P(x), R(x, y)
+Negation:       ~p
+Conjunction:    p & q
+Disjunction:    p | q
+Implication:    p -> q
+Equivalence:    p <-> q
+Parentheses:    (p | q) & r
 
-Organisation du fichier :
-  1. Analyse syntaxique des formules (Node, Parser, parse_formula)
-  2. Raisonnement classique par tables de vérité (consistent, entails, ...)
-  3. Structures de la logique des défauts (Default, Theory)
-  4. Algorithme des extensions, conséquences sceptique/crédule, diagnostics
+Predicates such as P(x) are treated as atomic propositions. Quantifiers and
+first-order unification are not implemented.
+
+The public names used by the rest of the project are preserved:
+FormulaError, Node, Parser, parse_formula, _to_sympy, _conjunction,
+consistent, entails, equivalent_theories, Default, Theory, and DefaultLogic.
 """
-from __future__ import annotations
-from dataclasses import dataclass, asdict
-from itertools import product, combinations
-import re
 
-# Découpage d'une formule en jetons (tokens), dans cet ordre de priorité :
-#   "<->" puis "->" (opérateurs longs d'abord), puis les symboles simples ( ) & , | ~
-#   puis un atome : un identifiant éventuellement suivi d'arguments entre
-#   parenthèses, ex. p, Oiseau, Vole(tweety), R(x, y).
-# Les arguments entre parenthèses font partie de l'atome (pas de logique du 1er ordre).
-TOKEN_RE = re.compile(r"<->|->|[()&,|~]|[A-Za-z_][A-Za-z0-9_]*(?:\([^()]*\))?")
+from __future__ import annotations
+
+from dataclasses import dataclass
+import re
+from typing import Any
+
+from sympy import And, Equivalent, Implies, Not, Or, Symbol, true
+from sympy.logic.boolalg import Boolean
+from sympy.logic.inference import satisfiable
+
+
+# Long operators must be matched before their shorter prefixes.
+# The optional (...) part belongs to the atom, so P(x, y) is one proposition.
+TOKEN_RE = re.compile(
+    r"<->|->|[()&|~]|[A-Za-z_][A-Za-z0-9_]*(?:\([^()]*\))?"
+)
+
 
 class FormulaError(ValueError):
-    """Erreur de syntaxe dans une formule ou un défaut (message affiché à l'utilisateur)."""
-    pass
+    """Erreur de syntaxe dans une formule ou un défaut."""
+
 
 @dataclass(frozen=True)
 class Node:
-    """Noeud de l'arbre syntaxique d'une formule.
+    """A node in the propositional formula syntax tree.
 
-    op  : 'atom', 'not', 'and', 'or', 'imp' (implication) ou 'iff' (équivalence)
-    left/right : sous-formules (right est None pour 'not' ; les deux sont None pour 'atom')
-    atom : nom de l'atome, renseigné seulement si op == 'atom'
+    op is one of: 'atom', 'not', 'and', 'or', 'imp', or 'iff'.
+    For an atom, only ``atom`` is populated. For a negation, ``left`` is the
+    child. Binary operators use both ``left`` and ``right``.
     """
+
     op: str
-    left: 'Node | None' = None
-    right: 'Node | None' = None
+    left: Node | None = None
+    right: Node | None = None
     atom: str | None = None
 
-
     def atoms(self) -> set[str]:
-        """Retourne l'ensemble des atomes présents dans la formule (parcours récursif)."""
-        if self.op == 'atom':
-            if self.atom is None:
-                raise ValueError("Atom node has no atom")
-            return {self.atom}
+        """Return every propositional atom occurring in this formula."""
+        if self.op == "atom":
+            return {self.atom} if self.atom is not None else set()
 
-        out: set[str] = set()
-
+        found: set[str] = set()
         if self.left is not None:
-            out |= self.left.atoms()
-
+            found.update(self.left.atoms())
         if self.right is not None:
-            out |= self.right.atoms()
+            found.update(self.right.atoms())
+        return found
 
-        return out
+    def to_sympy(self) -> Boolean:
+        """Convert this syntax tree into a SymPy Boolean expression."""
+        if self.op == "atom":
+            if not self.atom:
+                raise ValueError("Atom node has no atom")
+            # Symbol also accepts predicate-like names such as P(tweety).
+            return Symbol(self.atom)
 
-
-
-    def evaluate(self, env):
-        """Évalue la formule pour une interprétation env : {atome: True/False}."""
-        # Cas de base : la valeur de l'atome est donnée par l'interprétation
-        if self.op == 'atom':
-            return env[self.atom]
-
-        # Négation : seul opérateur unaire, il n'utilise que le fils gauche
-        if self.op == 'not':
+        if self.op == "not":
             if self.left is None:
                 raise ValueError("Negation node has no child")
-            return not self.left.evaluate(env)
+            return Not(self.left.to_sympy())
 
-        # Opérateurs binaires : on évalue les deux fils puis on applique la table de vérité
         if self.left is None or self.right is None:
-            raise ValueError(f"Operator {self.op} requires two operands")
+            raise ValueError(f"Operator {self.op!r} requires two operands")
 
-        a = self.left.evaluate(env)
-        b = self.right.evaluate(env)
+        a = self.left.to_sympy()
+        b = self.right.to_sympy()
 
-        return {
-            'and': a and b,
-            'or': a or b,
-            'imp': (not a) or b,   # a -> b  équivaut à  non a ou b
-            'iff': a == b          # a <-> b : vrai si a et b ont la même valeur
-        }[self.op]
+        operators = {
+            "and": lambda: And(a, b),
+            "or": lambda: Or(a, b),
+            "imp": lambda: Implies(a, b),
+            "iff": lambda: Equivalent(a, b),
+        }
+        try:
+            return operators[self.op]()
+        except KeyError as exc:
+            raise ValueError(f"Unknown formula operator: {self.op!r}") from exc
+
 
 class Parser:
-    """Analyseur récursif descendant. Une méthode par niveau de priorité.
+    """Recursive-descent parser with the project's original precedence rules.
 
-    Priorités (de la plus faible à la plus forte) :
-        <->   <   ->   <   |   <   &   <   ~ et parenthèses
-    '->' est associatif à droite (p -> q -> r = p -> (q -> r)),
-    '<->', '|' et '&' sont associatifs à gauche.
+    From lowest to highest precedence:
+        <->, ->, |, &, ~ and parentheses.
+
+    Implication is right-associative. Equivalence, disjunction, and
+    conjunction are left-associative.
     """
-    def __init__(self, text):
-        self.text = text.strip()
-        self.tokens = TOKEN_RE.findall(self.text)
-        # Vérification : les jetons reconnus, mis bout à bout, doivent redonner
-        # exactement le texte (sans espaces). Sinon un caractère illégal a été ignoré
-        # par la regex (ex. "p $ q") et la formule est refusée.
-        if not self.tokens or ''.join(self.tokens).replace(' ', '') != re.sub(r'\s+', '', self.text):
-            raise FormulaError(f"Formule invalide : {text}")
-        self.i = 0  # position du jeton courant
 
-    def peek(self):
-        """Jeton courant sans le consommer (None en fin de formule)."""
+    def __init__(self, text: str):
+        if not isinstance(text, str):
+            raise TypeError("Une formule doit être fournie sous forme de texte.")
+
+        self.text = text.strip()
+        self.tokens = self._tokenize(self.text)
+        self.i = 0
+
+    @staticmethod
+    def _tokenize(text: str) -> list[str]:
+        """Tokenize the whole input; never silently skip invalid characters."""
+        tokens: list[str] = []
+        position = 0
+
+        while position < len(text):
+            if text[position].isspace():
+                position += 1
+                continue
+
+            match = TOKEN_RE.match(text, position)
+            if match is None:
+                bad_character = text[position]
+                raise FormulaError(
+                    f"Symbole invalide {bad_character!r} à la position {position}."
+                )
+
+            tokens.append(match.group(0))
+            position = match.end()
+
+        if not tokens:
+            raise FormulaError("La formule est vide.")
+
+        return tokens
+
+    def peek(self) -> str | None:
+        """Return the current token without consuming it."""
         return self.tokens[self.i] if self.i < len(self.tokens) else None
 
-    def take(self, token=None):
-        """Consomme et retourne le jeton courant ; erreur s'il manque ou diffère de `token`."""
-        t = self.peek()
-        if t is None or (token is not None and t != token): raise FormulaError(f"Symbole attendu : {token or 'expression'}")
-        self.i += 1; return t
+    def take(self, token: str | None = None) -> str:
+        """Consume the current token, optionally checking its exact value."""
+        current = self.peek()
+        if current is None:
+            expected = token or "expression"
+            raise FormulaError(f"Symbole attendu : {expected}")
+        if token is not None and current != token:
+            raise FormulaError(f"Symbole attendu : {token}, trouvé : {current}")
 
-    def parse(self):
-        """Point d'entrée : analyse toute la formule et refuse les jetons restants."""
-        n = self.iff()
-        if self.peek() is not None: raise FormulaError(f"Symbole inattendu : {self.peek()}")
-        return n
+        self.i += 1
+        return current
 
-    def iff(self):
-        # niveau le plus faible : a <-> b <-> c (boucle = associativité gauche)
-        n = self.imp()
-        while self.peek() == '<->': self.take(); n = Node('iff', n, self.imp())
-        return n
+    def parse(self) -> Node:
+        """Parse a complete formula and reject any trailing token."""
+        node = self.iff()
+        remaining = self.peek()
+        if remaining is not None:
+            raise FormulaError(f"Symbole inattendu : {remaining}")
+        return node
 
-    def imp(self):
-        # a -> b : l'appel récursif à self.imp() donne l'associativité à droite
-        n = self.disj()
-        if self.peek() == '->': self.take(); n = Node('imp', n, self.imp())
-        return n
+    def iff(self) -> Node:
+        node = self.imp()
+        while self.peek() == "<->":
+            self.take("<->")
+            node = Node("iff", node, self.imp())
+        return node
 
-    def disj(self):
-        # a | b | c
-        n = self.conj()
-        while self.peek() == '|': self.take(); n = Node('or', n, self.conj())
-        return n
+    def imp(self) -> Node:
+        node = self.disj()
+        if self.peek() == "->":
+            self.take("->")
+            # Recursion on imp() makes implication right-associative.
+            node = Node("imp", node, self.imp())
+        return node
 
-    def conj(self):
-        # a & b & c
-        n = self.unary()
-        while self.peek() == '&': self.take(); n = Node('and', n, self.unary())
-        return n
+    def disj(self) -> Node:
+        node = self.conj()
+        while self.peek() == "|":
+            self.take("|")
+            node = Node("or", node, self.conj())
+        return node
 
-    def unary(self):
-        # ~f (négation, répétable : ~~f), (f) entre parenthèses, ou un atome
-        if self.peek() == '~': self.take(); return Node('not', self.unary())
-        if self.peek() == '(':
-            self.take(); n = self.iff(); self.take(')'); return n
-        t = self.take()
-        # un opérateur ou une parenthèse fermante ici signifie qu'un atome manque
-        if t in {'&','|','->','<->',')'}: raise FormulaError('Atome attendu')
-        return Node('atom', atom=t)
+    def conj(self) -> Node:
+        node = self.unary()
+        while self.peek() == "&":
+            self.take("&")
+            node = Node("and", node, self.unary())
+        return node
 
-def parse_formula(text):
-    """Transforme un texte en arbre Node (lève FormulaError si la syntaxe est incorrecte)."""
+    def unary(self) -> Node:
+        token = self.peek()
+
+        if token == "~":
+            self.take("~")
+            return Node("not", self.unary())
+
+        if token == "(":
+            self.take("(")
+            node = self.iff()
+            self.take(")")
+            return node
+
+        if token is None or token in {"&", "|", "->", "<->", ")"}:
+            raise FormulaError("Atome attendu")
+
+        atom = self.take()
+        return Node("atom", atom=atom)
+
+
+def parse_formula(text: str) -> Node:
+    """Convert text into a Node; raise FormulaError for invalid syntax."""
     return Parser(text).parse()
 
-# ---------------------------------------------------------------------------
-# Raisonnement classique par énumération des modèles (tables de vérité).
-# Exact mais exponentiel en nombre d'atomes : suffisant pour des théories de TP.
-# Les formules peuvent être passées en texte ou déjà analysées (Node).
-# ---------------------------------------------------------------------------
-
-def _models(formulas):
-    """Générateur : produit chaque interprétation (dict) qui rend TOUTES les formules vraies."""
-    nodes = [parse_formula(f) if isinstance(f, str) else f for f in formulas]
-    atoms = sorted(set().union(*(n.atoms() for n in nodes))) if nodes else []
-    # on essaie les 2^n affectations possibles de vrai/faux aux n atomes
-    for values in product([False, True], repeat=len(atoms)):
-        env = dict(zip(atoms, values))
-        if all(n.evaluate(env) for n in nodes): yield env
-
-def consistent(formulas):
-    """Vrai si l'ensemble de formules possède au moins un modèle (cohérent)."""
-    return next(_models(formulas), None) is not None
-
-def entails(premises, conclusion):
-    """Vrai si premises |= conclusion : aucun modèle des prémisses ne falsifie la conclusion."""
-    nodes = [parse_formula(f) if isinstance(f, str) else f for f in premises]
-    c = parse_formula(conclusion) if isinstance(conclusion, str) else conclusion
-    atoms = sorted(set().union(*(n.atoms() for n in nodes), c.atoms()))
-    for values in product([False, True], repeat=len(atoms)):
-        env = dict(zip(atoms, values))
-        # contre-exemple : prémisses vraies et conclusion fausse
-        if all(n.evaluate(env) for n in nodes) and not c.evaluate(env):
-            return False
-    return True
-
-def equivalent_theories(a, b):
-    """Vrai si les ensembles a et b ont exactement les mêmes modèles (Th(a) = Th(b))."""
-    atoms = sorted(set().union(*(parse_formula(x).atoms() for x in list(a)+list(b))))
-    for vals in product([False, True], repeat=len(atoms)):
-        env = dict(zip(atoms, vals))
-        if all(parse_formula(x).evaluate(env) for x in a) != all(parse_formula(x).evaluate(env) for x in b): return False
-    return True
 
 # ---------------------------------------------------------------------------
-# Structures de la logique des défauts
+# Classical reasoning through SymPy.
 # ---------------------------------------------------------------------------
+
+
+def _to_sympy(formula: Any) -> Boolean:
+    """Convert text or a Node to SymPy; accept a SymPy Boolean unchanged."""
+    if isinstance(formula, Node):
+        return formula.to_sympy()
+    if isinstance(formula, str):
+        return parse_formula(formula).to_sympy()
+    if isinstance(formula, Boolean):
+        return formula
+    raise TypeError(
+        "Une formule doit être une chaîne, un Node ou une expression booléenne SymPy."
+    )
+
+
+def _flatten_formulas(formulas: tuple[Any, ...]) -> list[Any]:
+    """Expand lists/tuples/sets passed as a single collection of formulas."""
+    flattened: list[Any] = []
+    for formula in formulas:
+        if isinstance(formula, (list, tuple, set)):
+            flattened.extend(_flatten_formulas(tuple(formula)))
+        else:
+            flattened.append(formula)
+    return flattened
+
+
+def _conjunction(*formulas: Any) -> Boolean:
+    """Return the conjunction of formulas; an empty collection means True.
+
+    Both calling styles are supported:
+        _conjunction("p", "q")
+        _conjunction(["p", "q"])
+    """
+    items = _flatten_formulas(formulas)
+    if not items:
+        return true
+
+    expressions = [_to_sympy(formula) for formula in items]
+    return And(*expressions) if len(expressions) > 1 else expressions[0]
+
+
+def consistent(*formulas: Any) -> bool:
+    """Return True iff the supplied formulas are jointly satisfiable."""
+    return satisfiable(_conjunction(*formulas)) is not False
+
+
+def entails(*premises: Any, conclusion: Any = None) -> bool:
+    """Return True iff the premises classically entail the conclusion.
+
+    Supports both the positional form already used in the project:
+        entails(["p", "p -> q"], "q")
+
+    and the explicit keyword form:
+        entails("p", "p -> q", conclusion="q")
+
+    The test uses the standard refutation method: premises |= conclusion iff
+    premises AND NOT conclusion is unsatisfiable.
+    """
+    premise_items = premises
+
+    # Backward compatibility: the original project calls entails(premises, phi)
+    # with the conclusion as the final positional argument.
+    if conclusion is None:
+        if len(premises) < 2:
+            raise TypeError("entails() requires premises and a conclusion")
+        premise_items = premises[:-1]
+        conclusion = premises[-1]
+
+    base = _conjunction(*premise_items)
+    counterexample_formula = And(base, Not(_to_sympy(conclusion)))
+    return satisfiable(counterexample_formula) is False
+
+
+def _as_formula_arguments(value: Any) -> tuple[Any, ...]:
+    """Treat a collection as several formulas and a single value as one."""
+    if isinstance(value, (list, tuple, set)):
+        return tuple(value)
+    return (value,)
+
+
+def equivalent_theories(a: Any, b: Any) -> bool:
+    """Return True iff the two formula collections have the same models."""
+    expr_a = _conjunction(*_as_formula_arguments(a))
+    expr_b = _conjunction(*_as_formula_arguments(b))
+    return satisfiable(Not(Equivalent(expr_a, expr_b))) is False
+
+
+# ---------------------------------------------------------------------------
+# Structures of Reiter default logic.
+# ---------------------------------------------------------------------------
+
 
 @dataclass
 class Default:
-    """Un défaut  prérequis : just1, just2, ... / conséquent  (formules stockées en texte)."""
+    """A default: prerequisite : justification(s) / consequent."""
+
     prerequisite: str
     justifications: list[str]
     consequent: str
-    def display(self):
-        """Forme affichable, au format de saisie : « α : β1, β2 / γ »."""
-        return f"{self.prerequisite} : {', '.join(self.justifications)} / {self.consequent}"
-    def validate(self):
-        """Vérifie que chaque partie est une formule correcte et qu'il y a >= 1 justification."""
-        parse_formula(self.prerequisite); parse_formula(self.consequent)
-        if not self.justifications: raise FormulaError('Un défaut doit avoir au moins une justification.')
-        for j in self.justifications: parse_formula(j)
+
+    def display(self) -> str:
+        """Return the default in the project's input/display format."""
+        return (
+            f"{self.prerequisite} : {', '.join(self.justifications)} / "
+            f"{self.consequent}"
+        )
+
+    def validate(self) -> None:
+        """Validate the prerequisite, consequent, and all justifications."""
+        parse_formula(self.prerequisite)
+        parse_formula(self.consequent)
+
+        if not self.justifications:
+            raise FormulaError("Un défaut doit avoir au moins une justification.")
+
+        for justification in self.justifications:
+            parse_formula(justification)
+
 
 @dataclass
 class Theory:
-    """Une théorie des défauts T = (W, D) : W = liste de formules, D = liste de Default."""
+    """A default theory T = (W, D), with facts W and defaults D."""
+
     world: list[str]
     defaults: list[Default]
-    def validate(self):
-        """Lève FormulaError si une formule de W ou un défaut de D est mal formé."""
-        for f in self.world: parse_formula(f)
-        for d in self.defaults: d.validate()
+
+    def validate(self) -> None:
+        """Validate all world formulas and defaults."""
+        for formula in self.world:
+            parse_formula(formula)
+        for default in self.defaults:
+            default.validate()
+
 
 class DefaultLogic:
-    """Calculs sur une théorie : extensions, conséquences, diagnostics."""
-    def __init__(self, theory: Theory):
-        theory.validate(); self.theory = theory  # refuse d'emblée une théorie mal formée
+    """Compute extensions, skeptical/credulous consequences, and diagnostics."""
 
-    def generate_extensions(self, max_defaults=18):
+    def __init__(self, theory: Theory):
+        theory.validate()
+        self.theory = theory
+
+    def generate_extensions(self, max_defaults: int = 18) -> list[dict[str, Any]]:
         """Compute Reiter extensions by candidate enumeration and Gamma iteration.
 
-        A candidate E is represented by W plus a subset of default consequents.
-        Gamma(E) is built from Th(W), repeatedly adding consequents whose
-        prerequisites follow at the current stage and whose justifications are
-        consistent with the candidate E. The candidate is an extension exactly
-        when Gamma(E) and E have the same classical models.
+        Each candidate E is represented by W plus a subset of default
+        consequents. Gamma(E) starts from W and repeatedly adds consequents
+        whose prerequisites follow from the generated formulas and whose
+        justifications remain consistent with the candidate E.
 
-        Retourne une liste de dictionnaires, un par extension :
-          'basis'    : formules qui engendrent l'extension (E = Th(basis))
-          'defaults' : défauts appliqués, sous forme de texte
-          'selected' : indices (dans D) des défauts appliqués
+        Each returned dictionary contains:
+          'basis'    : formulas generating the extension (E = Th(basis))
+          'defaults' : applied defaults, as display strings
+          'selected' : indices of applied defaults in the original D list
         """
-        ds = self.theory.defaults
-        # garde-fou : on énumère 2^n sous-ensembles de défauts
-        if len(ds) > max_defaults:
-            raise ValueError(f"{len(ds)} défauts : limite de sécurité {max_defaults} (2^n candidats).")
-        results = []
-        # chaque entier `mask` code un sous-ensemble de défauts (bit i = défaut i choisi)
-        for mask in range(1 << len(ds)):
-            selected = [i for i in range(len(ds)) if mask & (1 << i)]
-            # candidat E = W + conséquents des défauts supposés appliqués
-            candidate = self.theory.world + [ds[i].consequent for i in selected]
-            # un candidat incohérent est écarté (voir la limite sur W incohérent dans le rapport)
+        defaults = self.theory.defaults
+        if len(defaults) > max_defaults:
+            raise ValueError(
+                f"{len(defaults)} défauts : limite de sécurité {max_defaults} "
+                "(2^n candidats)."
+            )
+
+        results: list[dict[str, Any]] = []
+
+        # Enumerate all subsets of defaults (2^n candidates).
+        for mask in range(1 << len(defaults)):
+            selected = [
+                i for i in range(len(defaults)) if mask & (1 << i)
+            ]
+
+            candidate = self.theory.world + [
+                defaults[i].consequent for i in selected
+            ]
+
+            # Inconsistent candidates cannot be extensions.
             if not consistent(candidate):
                 continue
-            # --- calcul de Gamma(E) : on part de W et on ajoute des conséquents ---
+
             generated = list(self.theory.world)
-            applied = []        # indices des défauts appliqués dans Gamma(E)
+            applied: list[int] = []
             changed = True
-            while changed:      # on itère jusqu'à ce qu'aucun défaut ne puisse plus s'appliquer
+
+            while changed:
                 changed = False
-                for i, d in enumerate(ds):
+                for i, default in enumerate(defaults):
                     if i in applied:
                         continue
-                    # chaque justification doit être cohérente avec le CANDIDAT E
-                    # (et non avec ce qui est déjà généré) : c'est la définition de Reiter
-                    justifications_ok = all(consistent(candidate + [j]) for j in d.justifications)
-                    # le prérequis doit être déduit de ce qui est généré jusqu'ici
-                    if justifications_ok and entails(generated, d.prerequisite):
-                        generated.append(d.consequent)
+
+                    # Reiter's justifications are checked against candidate E.
+                    justifications_ok = all(
+                        consistent(candidate + [justification])
+                        for justification in default.justifications
+                    )
+
+                    # The prerequisite must follow from what Gamma has generated.
+                    if justifications_ok and entails(
+                        generated, default.prerequisite
+                    ):
+                        generated.append(default.consequent)
                         applied.append(i)
                         changed = True
-            # E est une extension si E = Gamma(E), i.e. mêmes modèles
+
+            # E is an extension iff E and Gamma(E) have the same models.
             if equivalent_theories(candidate, generated):
-                # on évite les doublons (même extension obtenue par plusieurs sous-ensembles)
-                if not any(equivalent_theories(e['basis'], candidate) for e in results):
-                    results.append({'selected': applied, 'basis': generated,
-                                    'defaults': [ds[i].display() for i in applied]})
+                # Avoid duplicate extensions generated by different subsets.
+                if not any(
+                    equivalent_theories(result["basis"], candidate)
+                    for result in results
+                ):
+                    results.append(
+                        {
+                            "selected": applied,
+                            "basis": generated,
+                            "defaults": [
+                                defaults[i].display() for i in applied
+                            ],
+                        }
+                    )
+
         return results
 
-    def consequence(self, formula, extensions):
-        """Teste si `formula` est conséquence sceptique / crédule des extensions données.
+    def consequence(
+        self, formula: str, extensions: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Test skeptical and credulous consequence over given extensions.
 
-        sceptique : vraie dans TOUTES les extensions ; crédule : vraie dans AU MOINS UNE.
-        Sans extension, les deux réponses sont False (choix de convention).
-        `per_extension` détaille le résultat pour chaque extension.
+        Skeptical: true in every extension.
+        Credulous: true in at least one extension.
+        With no extensions, both values are False by convention.
         """
-        parse_formula(formula)  # lève FormulaError si la formule est invalide
-        if not extensions: return {'skeptical': False, 'credulous': False, 'per_extension': []}
-        checks = [entails(e['basis'], formula) for e in extensions]
-        return {'skeptical': all(checks), 'credulous': any(checks), 'per_extension': checks}
+        parse_formula(formula)
+        if not extensions:
+            return {
+                "skeptical": False,
+                "credulous": False,
+                "per_extension": [],
+            }
 
-    def diagnostics(self):
-        """Retourne une liste d'avertissements (texte) sur la théorie, sans calculer les extensions."""
-        warnings = []
+        checks = [entails(extension["basis"], formula) for extension in extensions]
+        return {
+            "skeptical": all(checks),
+            "credulous": any(checks),
+            "per_extension": checks,
+        }
+
+    def diagnostics(self) -> list[str]:
+        """Return warnings about inconsistent facts or default justifications."""
+        warnings: list[str] = []
+
         if not consistent(self.theory.world):
-            warnings.append('Le monde W est incohérent : il ne possède pas de modèle classique.')
+            warnings.append(
+                "Le monde W est incohérent : il ne possède pas de modèle classique."
+            )
+
         for i, default in enumerate(self.theory.defaults, 1):
-            # The assignment explicitly requires checking each justification on its own.
-            # For example, the formula "x & ~x" has no classical model, so this
-            # default can never be applicable.
+            # Check each justification separately.
             for justification in default.justifications:
                 if not consistent([justification]):
                     warnings.append(
-                        f"d{i} : la justification « {justification} » est incohérente ; "
-                        "ce défaut ne sera jamais applicable."
+                        f"d{i} : la justification « {justification} » est "
+                        "incohérente ; ce défaut ne sera jamais applicable."
                     )
-            # Also report the separate case where individually consistent
-            # justifications cannot all hold together.
-            if len(default.justifications) > 1 and not consistent(default.justifications):
+
+            # Also check whether the justifications are jointly consistent.
+            if (
+                len(default.justifications) > 1
+                and not consistent(default.justifications)
+            ):
                 warnings.append(
                     f"d{i} : les justifications sont conjointement incohérentes "
                     "(elles sont incompatibles entre elles)."
                 )
+
         return warnings
